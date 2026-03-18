@@ -17,10 +17,18 @@ permissions:
 
 jobs:
   pi:
-    uses: W3Dev/pi-agent/.github/workflows/pi-comment-agent.yml@main
-    with:
-      pi_allow_push: ${{ vars.PI_ALLOW_PUSH || 'false' }}
-      pi_cli_version: '0.58.3'
-      pi_model: 'zai/glm-5'
-    secrets:
-      pi_model_json: ${{ secrets.PI_MODEL_JSON }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run pi agent
+        uses: W3Dev/pi-agent@main
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          pi-model-json: ${{ secrets.PI_MODEL_JSON }}
+          pi-allow-push: ${{ vars.PI_ALLOW_PUSH || 'false' }}
+          pi-cli-version: '0.58.3'
+          pi-model: 'zai/glm-5'

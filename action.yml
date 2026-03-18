@@ -1,0 +1,205 @@
+name: pi-agent
+description: Route /pi comments to ask, build, plan, or general agent modes and post the result back to GitHub.
+
+inputs:
+  github-token:
+    description: GitHub token used to read PR metadata and post the final comment.
+    required: true
+  pi-model-json:
+    description: JSON contents for ~/.pi/agent/models.json.
+    required: true
+  pi-allow-push:
+    description: Whether to commit and push changes back to the PR branch.
+    required: false
+    default: "false"
+  pi-cli-version:
+    description: Version of @mariozechner/pi-coding-agent to install.
+    required: false
+    default: "0.58.3"
+  pi-model:
+    description: Default model passed to pi.
+    required: false
+    default: "zai/glm-5"
+
+runs:
+  using: composite
+  steps:
+    - name: Resolve command metadata
+      id: meta
+      uses: actions/github-script@v7
+      with:
+        github-token: ${{ inputs.github-token }}
+        script: |
+          const body = context.payload.comment?.body || ''
+          const command = body.replace(/^\/pi\s*/, '').replace(/\r/g, '')
+          const eventName = context.eventName
+          const actor = context.actor
+          const defaultBranch = context.payload.repository.default_branch
+          const authorAssociation = context.payload.comment?.author_association || ''
+          const isPiCommand = body.startsWith('/pi')
+          const isAuthorized = ['OWNER', 'MEMBER', 'COLLABORATOR'].includes(authorAssociation)
+          const shouldRun = isPiCommand && isAuthorized
+
+          let targetNumber
+          let baseRef = defaultBranch
+          let headRef = defaultBranch
+          let isPr = false
+
+          if (eventName === 'pull_request_review_comment') {
+            const pr = context.payload.pull_request
+            targetNumber = pr.number
+            baseRef = pr.base.ref
+            headRef = pr.head.ref
+            isPr = true
+          } else if (context.payload.issue?.pull_request) {
+            targetNumber = context.payload.issue.number
+            const pr = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: targetNumber,
+            })
+            baseRef = pr.data.base.ref
+            headRef = pr.data.head.ref
+            isPr = true
+          } else {
+            targetNumber = context.payload.issue.number
+          }
+
+          core.setOutput('command', command)
+          core.setOutput('actor', actor)
+          core.setOutput('event_name', eventName)
+          core.setOutput('target_number', String(targetNumber))
+          core.setOutput('base_ref', baseRef)
+          core.setOutput('head_ref', headRef)
+          core.setOutput('is_pr', isPr ? 'true' : 'false')
+          core.setOutput('should_run', shouldRun ? 'true' : 'false')
+
+    - name: Setup Node
+      if: steps.meta.outputs.should_run == 'true'
+      uses: actions/setup-node@v4
+      with:
+        node-version: "22"
+
+    - name: Setup Python
+      if: steps.meta.outputs.should_run == 'true'
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.11"
+
+    - name: Install jq
+      if: steps.meta.outputs.should_run == 'true'
+      shell: bash
+      run: |
+        set -euo pipefail
+        sudo apt-get update
+        sudo apt-get install -y jq
+
+    - name: Cache npm
+      if: steps.meta.outputs.should_run == 'true'
+      uses: actions/cache@v4
+      with:
+        path: ~/.npm
+        key: npm-${{ runner.os }}-pi-${{ inputs.pi-cli-version }}
+        restore-keys: |
+          npm-${{ runner.os }}-pi-
+
+    - name: Install pi CLI
+      if: steps.meta.outputs.should_run == 'true'
+      shell: bash
+      run: |
+        set -euo pipefail
+        npm install -g @mariozechner/pi-coding-agent@${{ inputs.pi-cli-version }}
+
+    - name: Configure pi models
+      if: steps.meta.outputs.should_run == 'true'
+      shell: bash
+      env:
+        PI_MODEL_JSON: ${{ inputs.pi-model-json }}
+      run: |
+        set -euo pipefail
+        mkdir -p "$HOME/.pi/agent"
+        printf '%s' "$PI_MODEL_JSON" > "$HOME/.pi/agent/models.json"
+
+    - name: List pi models
+      if: steps.meta.outputs.should_run == 'true'
+      shell: bash
+      run: |
+        set -euo pipefail
+        pi --list-models
+
+    - name: Build report directory
+      if: steps.meta.outputs.should_run == 'true'
+      shell: bash
+      run: |
+        set -euo pipefail
+        mkdir -p .pi-agent
+
+    - name: Collect git context
+      if: steps.meta.outputs.should_run == 'true'
+      shell: bash
+      run: |
+        set -euo pipefail
+        git status --short > .pi-agent/git-status.txt || true
+        git branch --show-current > .pi-agent/current-branch.txt || true
+        git log --oneline -n 20 > .pi-agent/recent-commits.txt || true
+        git diff --stat > .pi-agent/working-tree-diff-stat.txt || true
+        find . -maxdepth 3 -type f \
+          ! -path './.git/*' \
+          ! -path './node_modules/*' \
+          ! -path './.venv/*' \
+          | sort | head -n 500 > .pi-agent/file-list.txt
+
+        if [[ '${{ steps.meta.outputs.is_pr }}' == 'true' ]]; then
+          git fetch origin '${{ steps.meta.outputs.base_ref }}' --depth=1 || true
+          git diff --name-only "origin/${{ steps.meta.outputs.base_ref }}...HEAD" > .pi-agent/pr-files.txt || true
+          git diff --stat "origin/${{ steps.meta.outputs.base_ref }}...HEAD" > .pi-agent/pr-diff-stat.txt || true
+        else
+          touch .pi-agent/pr-files.txt .pi-agent/pr-diff-stat.txt
+        fi
+
+    - name: Run pi agent
+      if: steps.meta.outputs.should_run == 'true'
+      shell: bash
+      env:
+        PI_COMMAND: ${{ steps.meta.outputs.command }}
+        PI_IS_PR: ${{ steps.meta.outputs.is_pr }}
+        PI_BASE_REF: ${{ steps.meta.outputs.base_ref }}
+        PI_HEAD_REF: ${{ steps.meta.outputs.head_ref }}
+        PI_EVENT_NAME: ${{ steps.meta.outputs.event_name }}
+        PI_ACTOR: ${{ steps.meta.outputs.actor }}
+        PI_ALLOW_PUSH: ${{ inputs.pi-allow-push }}
+        PI_MODEL: ${{ inputs.pi-model }}
+      run: |
+        bash "$GITHUB_ACTION_PATH/scripts/pi-agent-runner.sh"
+
+    - name: Commit and push changes
+      if: steps.meta.outputs.should_run == 'true' && steps.meta.outputs.is_pr == 'true' && inputs.pi-allow-push == 'true'
+      shell: bash
+      run: |
+        set -euo pipefail
+        if [[ -n "$(git status --porcelain)" ]]; then
+          git config user.name "pi-bot"
+          git config user.email "pi-bot@users.noreply.github.com"
+          git add -A
+          git commit -m "pi: apply requested changes from comment"
+          git push origin HEAD:${{ steps.meta.outputs.head_ref }}
+        fi
+
+    - name: Post final reply
+      if: steps.meta.outputs.should_run == 'true'
+      uses: actions/github-script@v7
+      env:
+        PI_TARGET_NUMBER: ${{ steps.meta.outputs.target_number }}
+        PI_REPORT_PATH: .pi-agent/final-comment.md
+      with:
+        github-token: ${{ inputs.github-token }}
+        script: |
+          const fs = require('fs')
+          const path = process.env.PI_REPORT_PATH
+          const body = fs.readFileSync(path, 'utf8')
+          await github.rest.issues.createComment({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            issue_number: Number(process.env.PI_TARGET_NUMBER),
+            body,
+          })

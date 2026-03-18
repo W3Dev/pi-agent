@@ -13,6 +13,7 @@ The general router decides which agent to invoke based on the comment text.
 
 ## What this repo contains
 
+- `action.yml`: root composite action so consuming repositories can use `W3Dev/pi-agent@main`.
 - `.github/workflows/pi-comment-agent.yml`: reusable workflow that screens `/pi` comments, authorizes supported users, resolves PR metadata, installs `pi`, runs the routed agent flow, optionally pushes changes, and posts a comment back.
 - `scripts/pi-agent-runner.sh`: shared shell runner that routes requests to `ask`, `build`, `plan`, or `general`.
 - `examples/caller-workflow.yml`: tiny trigger-only wrapper for consuming repositories.
@@ -28,14 +29,14 @@ Create these in the consuming repository:
 The caller workflow is responsible only for:
 
 - listening to `issue_comment` and `pull_request_review_comment`
-- calling the reusable workflow in this repo
+- checking out the repository
+- calling the root action in this repo
 
-The reusable workflow is responsible for:
+The action is responsible for:
 
 - checking whether the comment starts with `/pi`
 - authorizing supported comment authors (`OWNER`, `MEMBER`, `COLLABORATOR`)
 - extracting event metadata and resolving PR branch details
-- checking out the target repo
 - installing `pi`
 - writing `~/.pi/agent/models.json`
 - listing available models for debugging
@@ -58,11 +59,16 @@ Minimal wrapper:
 ```yaml
 jobs:
   pi:
-    uses: W3Dev/pi-agent/.github/workflows/pi-comment-agent.yml@main
-    with:
-      pi_allow_push: ${{ vars.PI_ALLOW_PUSH || 'false' }}
-    secrets:
-      pi_model_json: ${{ secrets.PI_MODEL_JSON }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: W3Dev/pi-agent@main
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          pi-model-json: ${{ secrets.PI_MODEL_JSON }}
+          pi-allow-push: ${{ vars.PI_ALLOW_PUSH || 'false' }}
 ```
 
 Example requests:
@@ -73,5 +79,5 @@ Example requests:
 
 ## Notes
 
-- The reusable workflow currently checks out this repo from `W3Dev/pi-agent`. Update that repository reference if you publish it elsewhere.
+- The root action syntax is `uses: W3Dev/pi-agent@main`. The `.github/workflows/...@main` form is only for reusable workflows.
 - GitHub still requires the consuming repository to define the event trigger workflow on its default branch. This repo keeps that wrapper as small as possible, but it cannot remove that GitHub platform requirement.
