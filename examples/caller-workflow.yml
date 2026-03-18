@@ -1,0 +1,125 @@
+name: pi comment agent
+
+on:
+  issue_comment:
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
+
+concurrency:
+  group: pi-comment-agent-${{ github.event_name }}-${{ github.event.issue.number || github.event.pull_request.number || github.event.comment.id }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+jobs:
+  prepare:
+    if: >-
+      github.event.comment != null &&
+      (
+        contains(github.event.comment.body, '/pi ') ||
+        startsWith(github.event.comment.body, '/pi')
+      ) &&
+      (
+        github.event.comment.author_association == 'OWNER' ||
+        github.event.comment.author_association == 'MEMBER' ||
+        github.event.comment.author_association == 'COLLABORATOR'
+      )
+    runs-on: ubuntu-latest
+    outputs:
+      actor: ${{ steps.meta.outputs.actor }}
+      base_ref: ${{ steps.meta.outputs.base_ref }}
+      checkout_ref: ${{ steps.checkout_ref.outputs.checkout_ref }}
+      command: ${{ steps.meta.outputs.command }}
+      event_name: ${{ steps.meta.outputs.event_name }}
+      head_ref: ${{ steps.meta.outputs.head_ref }}
+      is_pr: ${{ steps.meta.outputs.is_pr }}
+      target_number: ${{ steps.meta.outputs.target_number }}
+    steps:
+      - name: Determine PR branch for issue_comment on pull requests
+        if: github.event_name == 'issue_comment' && github.event.issue.pull_request
+        id: pr_branch
+        uses: xt0rted/pull-request-comment-branch@v3
+
+      - name: Compute checkout ref
+        id: checkout_ref
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ "${GITHUB_EVENT_NAME}" == "pull_request_review_comment" ]]; then
+            REF="${{ github.event.pull_request.head.ref }}"
+          elif [[ "${GITHUB_EVENT_NAME}" == "issue_comment" ]]; then
+            if jq -e '.issue.pull_request' "$GITHUB_EVENT_PATH" >/dev/null 2>&1; then
+              REF="${{ steps.pr_branch.outputs.head_ref }}"
+            else
+              REF="${{ github.event.repository.default_branch }}"
+            fi
+          else
+            REF="${{ github.event.repository.default_branch }}"
+          fi
+
+          echo "checkout_ref=${REF}" >> "$GITHUB_OUTPUT"
+
+      - name: Capture command metadata
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          COMMENT_BODY=$(jq -r '.comment.body' "$GITHUB_EVENT_PATH")
+          ACTOR="$GITHUB_ACTOR"
+          EVENT_NAME="$GITHUB_EVENT_NAME"
+
+          if [[ "$EVENT_NAME" == "pull_request_review_comment" ]]; then
+            TARGET_NUMBER=$(jq -r '.pull_request.number' "$GITHUB_EVENT_PATH")
+            BASE_REF=$(jq -r '.pull_request.base.ref' "$GITHUB_EVENT_PATH")
+            HEAD_REF=$(jq -r '.pull_request.head.ref' "$GITHUB_EVENT_PATH")
+            IS_PR=true
+          elif jq -e '.issue.pull_request' "$GITHUB_EVENT_PATH" >/dev/null 2>&1; then
+            TARGET_NUMBER=$(jq -r '.issue.number' "$GITHUB_EVENT_PATH")
+            BASE_REF=$(jq -r '.repository.default_branch' "$GITHUB_EVENT_PATH")
+            HEAD_REF='${{ steps.pr_branch.outputs.head_ref }}'
+            IS_PR=true
+          else
+            TARGET_NUMBER=$(jq -r '.issue.number' "$GITHUB_EVENT_PATH")
+            BASE_REF=$(jq -r '.repository.default_branch' "$GITHUB_EVENT_PATH")
+            HEAD_REF='${{ github.event.repository.default_branch }}'
+            IS_PR=false
+          fi
+
+          CLEAN_COMMAND=$(printf '%s' "$COMMENT_BODY" | sed -E 's#^/pi[[:space:]]*##')
+          CLEAN_COMMAND=$(printf '%s' "$CLEAN_COMMAND" | tr -d '\r')
+
+          {
+            echo "actor=$ACTOR"
+            echo "base_ref=$BASE_REF"
+            echo "command<<EOF"
+            echo "$CLEAN_COMMAND"
+            echo "EOF"
+            echo "event_name=$EVENT_NAME"
+            echo "head_ref=$HEAD_REF"
+            echo "is_pr=$IS_PR"
+            echo "target_number=$TARGET_NUMBER"
+          } >> "$GITHUB_OUTPUT"
+
+  run-agent:
+    needs: prepare
+    uses: W3Dev/pi-agent/.github/workflows/pi-comment-agent.yml@main
+    with:
+      command: ${{ needs.prepare.outputs.command }}
+      actor: ${{ needs.prepare.outputs.actor }}
+      event_name: ${{ needs.prepare.outputs.event_name }}
+      is_pr: ${{ needs.prepare.outputs.is_pr }}
+      base_ref: ${{ needs.prepare.outputs.base_ref }}
+      head_ref: ${{ needs.prepare.outputs.head_ref }}
+      target_number: ${{ needs.prepare.outputs.target_number }}
+      checkout_ref: ${{ needs.prepare.outputs.checkout_ref }}
+      pi_allow_push: ${{ vars.PI_ALLOW_PUSH || 'false' }}
+      pi_cli_version: '0.58.3'
+      pi_model: 'zai/glm-5'
+    secrets:
+      pi_model_json: ${{ secrets.PI_MODEL_JSON }}

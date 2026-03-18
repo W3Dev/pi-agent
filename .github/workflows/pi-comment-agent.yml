@@ -1,0 +1,193 @@
+name: pi comment agent reusable
+
+on:
+  workflow_call:
+    inputs:
+      command:
+        required: true
+        type: string
+      actor:
+        required: true
+        type: string
+      event_name:
+        required: true
+        type: string
+      is_pr:
+        required: true
+        type: string
+      base_ref:
+        required: true
+        type: string
+      head_ref:
+        required: true
+        type: string
+      target_number:
+        required: true
+        type: string
+      checkout_ref:
+        required: true
+        type: string
+      pi_allow_push:
+        required: false
+        default: "false"
+        type: string
+      pi_cli_version:
+        required: false
+        default: "0.58.3"
+        type: string
+      pi_model:
+        required: false
+        default: "zai/glm-5"
+        type: string
+    secrets:
+      pi_model_json:
+        required: true
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+jobs:
+  run-agent:
+    name: Run pi agent
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout target repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.checkout_ref }}
+          fetch-depth: 0
+
+      - name: Checkout pi agent source
+        uses: actions/checkout@v4
+        with:
+          repository: W3Dev/pi-agent
+          path: .pi-agent-source
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install jq
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y jq
+
+      - name: Cache npm
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: npm-${{ runner.os }}-pi-${{ inputs.pi_cli_version }}
+          restore-keys: |
+            npm-${{ runner.os }}-pi-
+
+      - name: Install pi CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm install -g @mariozechner/pi-coding-agent@${{ inputs.pi_cli_version }}
+
+      - name: Configure pi models
+        shell: bash
+        env:
+          PI_MODEL_JSON: ${{ secrets.pi_model_json }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.pi/agent"
+          printf '%s' "$PI_MODEL_JSON" > "$HOME/.pi/agent/models.json"
+
+      - name: List pi models
+        shell: bash
+        run: |
+          set -euo pipefail
+          pi --list-models
+
+      - name: Build report directory
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .pi-agent
+
+      - name: Collect git context
+        shell: bash
+        run: |
+          set -euo pipefail
+          git status --short > .pi-agent/git-status.txt || true
+          git branch --show-current > .pi-agent/current-branch.txt || true
+          git log --oneline -n 20 > .pi-agent/recent-commits.txt || true
+          git diff --stat > .pi-agent/working-tree-diff-stat.txt || true
+          find . -maxdepth 3 -type f \
+            ! -path './.git/*' \
+            ! -path './node_modules/*' \
+            ! -path './.venv/*' \
+            | sort | head -n 500 > .pi-agent/file-list.txt
+
+          if [[ '${{ inputs.is_pr }}' == 'true' ]]; then
+            git fetch origin '${{ inputs.base_ref }}' --depth=1 || true
+            git diff --name-only "origin/${{ inputs.base_ref }}...HEAD" > .pi-agent/pr-files.txt || true
+            git diff --stat "origin/${{ inputs.base_ref }}...HEAD" > .pi-agent/pr-diff-stat.txt || true
+          else
+            touch .pi-agent/pr-files.txt .pi-agent/pr-diff-stat.txt
+          fi
+
+      - name: Run pi agent
+        shell: bash
+        env:
+          PI_COMMAND: ${{ inputs.command }}
+          PI_IS_PR: ${{ inputs.is_pr }}
+          PI_BASE_REF: ${{ inputs.base_ref }}
+          PI_HEAD_REF: ${{ inputs.head_ref }}
+          PI_EVENT_NAME: ${{ inputs.event_name }}
+          PI_ACTOR: ${{ inputs.actor }}
+          PI_ALLOW_PUSH: ${{ inputs.pi_allow_push }}
+          PI_MODEL: ${{ inputs.pi_model }}
+        run: |
+          bash .pi-agent-source/scripts/pi-agent-runner.sh
+
+      - name: Commit and push changes
+        if: inputs.is_pr == 'true' && inputs.pi_allow_push == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -n "$(git status --porcelain)" ]]; then
+            git config user.name "pi-bot"
+            git config user.email "pi-bot@users.noreply.github.com"
+            git add -A
+            git commit -m "pi: apply requested changes from comment"
+            git push origin HEAD:${{ inputs.head_ref }}
+          fi
+
+      - name: Post final reply
+        uses: actions/github-script@v7
+        env:
+          PI_TARGET_NUMBER: ${{ inputs.target_number }}
+          PI_REPORT_PATH: .pi-agent/final-comment.md
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs')
+            const path = process.env.PI_REPORT_PATH
+            const body = fs.readFileSync(path, 'utf8')
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: Number(process.env.PI_TARGET_NUMBER),
+              body,
+            })
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pi-agent-artifacts
+          path: .pi-agent/
