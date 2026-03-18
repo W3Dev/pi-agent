@@ -3,30 +3,6 @@ name: pi comment agent reusable
 on:
   workflow_call:
     inputs:
-      command:
-        required: true
-        type: string
-      actor:
-        required: true
-        type: string
-      event_name:
-        required: true
-        type: string
-      is_pr:
-        required: true
-        type: string
-      base_ref:
-        required: true
-        type: string
-      head_ref:
-        required: true
-        type: string
-      target_number:
-        required: true
-        type: string
-      checkout_ref:
-        required: true
-        type: string
       pi_allow_push:
         required: false
         default: "false"
@@ -51,13 +27,73 @@ permissions:
 jobs:
   run-agent:
     name: Run pi agent
+    if: >-
+      github.event.comment != null &&
+      (
+        contains(github.event.comment.body, '/pi ') ||
+        startsWith(github.event.comment.body, '/pi')
+      ) &&
+      (
+        github.event.comment.author_association == 'OWNER' ||
+        github.event.comment.author_association == 'MEMBER' ||
+        github.event.comment.author_association == 'COLLABORATOR'
+      )
     runs-on: ubuntu-latest
 
     steps:
+      - name: Resolve command metadata
+        id: meta
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const body = context.payload.comment?.body || ''
+            const command = body.replace(/^\/pi\s*/, '').replace(/\r/g, '')
+            const eventName = context.eventName
+            const actor = context.actor
+            const defaultBranch = context.payload.repository.default_branch
+
+            let targetNumber
+            let baseRef = defaultBranch
+            let headRef = defaultBranch
+            let checkoutRef = defaultBranch
+            let isPr = false
+
+            if (eventName === 'pull_request_review_comment') {
+              const pr = context.payload.pull_request
+              targetNumber = pr.number
+              baseRef = pr.base.ref
+              headRef = pr.head.ref
+              checkoutRef = pr.head.ref
+              isPr = true
+            } else if (context.payload.issue?.pull_request) {
+              targetNumber = context.payload.issue.number
+              const pr = await github.rest.pulls.get({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: targetNumber,
+              })
+              baseRef = pr.data.base.ref
+              headRef = pr.data.head.ref
+              checkoutRef = pr.data.head.ref
+              isPr = true
+            } else {
+              targetNumber = context.payload.issue.number
+            }
+
+            core.setOutput('command', command)
+            core.setOutput('actor', actor)
+            core.setOutput('event_name', eventName)
+            core.setOutput('target_number', String(targetNumber))
+            core.setOutput('base_ref', baseRef)
+            core.setOutput('head_ref', headRef)
+            core.setOutput('checkout_ref', checkoutRef)
+            core.setOutput('is_pr', isPr ? 'true' : 'false')
+
       - name: Checkout target repository
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.checkout_ref }}
+          ref: ${{ steps.meta.outputs.checkout_ref }}
           fetch-depth: 0
 
       - name: Checkout pi agent source
@@ -132,10 +168,10 @@ jobs:
             ! -path './.venv/*' \
             | sort | head -n 500 > .pi-agent/file-list.txt
 
-          if [[ '${{ inputs.is_pr }}' == 'true' ]]; then
-            git fetch origin '${{ inputs.base_ref }}' --depth=1 || true
-            git diff --name-only "origin/${{ inputs.base_ref }}...HEAD" > .pi-agent/pr-files.txt || true
-            git diff --stat "origin/${{ inputs.base_ref }}...HEAD" > .pi-agent/pr-diff-stat.txt || true
+          if [[ '${{ steps.meta.outputs.is_pr }}' == 'true' ]]; then
+            git fetch origin '${{ steps.meta.outputs.base_ref }}' --depth=1 || true
+            git diff --name-only "origin/${{ steps.meta.outputs.base_ref }}...HEAD" > .pi-agent/pr-files.txt || true
+            git diff --stat "origin/${{ steps.meta.outputs.base_ref }}...HEAD" > .pi-agent/pr-diff-stat.txt || true
           else
             touch .pi-agent/pr-files.txt .pi-agent/pr-diff-stat.txt
           fi
@@ -143,19 +179,19 @@ jobs:
       - name: Run pi agent
         shell: bash
         env:
-          PI_COMMAND: ${{ inputs.command }}
-          PI_IS_PR: ${{ inputs.is_pr }}
-          PI_BASE_REF: ${{ inputs.base_ref }}
-          PI_HEAD_REF: ${{ inputs.head_ref }}
-          PI_EVENT_NAME: ${{ inputs.event_name }}
-          PI_ACTOR: ${{ inputs.actor }}
+          PI_COMMAND: ${{ steps.meta.outputs.command }}
+          PI_IS_PR: ${{ steps.meta.outputs.is_pr }}
+          PI_BASE_REF: ${{ steps.meta.outputs.base_ref }}
+          PI_HEAD_REF: ${{ steps.meta.outputs.head_ref }}
+          PI_EVENT_NAME: ${{ steps.meta.outputs.event_name }}
+          PI_ACTOR: ${{ steps.meta.outputs.actor }}
           PI_ALLOW_PUSH: ${{ inputs.pi_allow_push }}
           PI_MODEL: ${{ inputs.pi_model }}
         run: |
           bash .pi-agent-source/scripts/pi-agent-runner.sh
 
       - name: Commit and push changes
-        if: inputs.is_pr == 'true' && inputs.pi_allow_push == 'true'
+        if: steps.meta.outputs.is_pr == 'true' && inputs.pi_allow_push == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -164,13 +200,13 @@ jobs:
             git config user.email "pi-bot@users.noreply.github.com"
             git add -A
             git commit -m "pi: apply requested changes from comment"
-            git push origin HEAD:${{ inputs.head_ref }}
+            git push origin HEAD:${{ steps.meta.outputs.head_ref }}
           fi
 
       - name: Post final reply
         uses: actions/github-script@v7
         env:
-          PI_TARGET_NUMBER: ${{ inputs.target_number }}
+          PI_TARGET_NUMBER: ${{ steps.meta.outputs.target_number }}
           PI_REPORT_PATH: .pi-agent/final-comment.md
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
