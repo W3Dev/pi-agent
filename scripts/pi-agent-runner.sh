@@ -3,7 +3,7 @@ set -euo pipefail
 
 mkdir -p .pi-agent
 
-MODEL_NAME="${PI_MODEL:-zai/glm-5}"
+MODEL_NAME="${PI_MODEL:-aistack/coding"
 
 normalize_agent_name() {
   case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in
